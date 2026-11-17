@@ -1,0 +1,6 @@
+{
+  "name": "SiamVault Pay",
+  "description": "ระบบ Payment Gateway ความปลอดภัยสูง รองรับบัตรเครดิต 3DS2 และ Thai PromptPay QR มาตรฐาน EMVCo พร้อมการเข้ารหัส AES-256-GCM และ HMAC-SHA256",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
