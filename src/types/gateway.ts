@@ -49,6 +49,9 @@ export interface PaymentIntent {
   createdAt: string;
   transactionId?: string;
   stripePaymentIntentId?: string;
+  successUrl?: string;
+  cancelUrl?: string;
+  webhookUrl?: string;
 }
 
 export interface TransactionRecord {
@@ -139,4 +142,12 @@ export interface StripeConfigResponse {
   publishableKey: string | null;
   mode: 'live' | 'test' | 'unconfigured';
   webhookConfigured: boolean;
+}
+
+export interface HostedCheckoutSession {
+  intent: PaymentIntent;
+  merchantName: string;
+  promptPayId: string;
+  stripeConfig: StripeConfigResponse;
+  transaction: TransactionRecord | null;
 }

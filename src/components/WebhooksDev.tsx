@@ -78,13 +78,17 @@ export function verifySiamVaultWebhook(rawBody: string, sigHeader: string, secre
   return crypto.timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(parts.v1, 'hex'));
 }`;
 
-  const curlCreateIntent = `curl -X POST ${window.location.origin}/api/v1/payment-intents \\
+  const curlCreateIntent = `curl -X POST ${window.location.origin}/api/v1/merchant/checkout-sessions \\
+  -H "Authorization: Bearer YOUR_PAYMENT_GATEWAY_SECRET" \\
   -H "Content-Type: application/json" \\
   -d '{
-    "amount": 1850,
+    "amount": 2490,
     "orderId": "ORD-2026-9001",
-    "description": "Cloud Package",
-    "idempotencyKey": "idem_9001_abc"
+    "description": "คำสั่งซื้อจาก Vela Commerce",
+    "customerEmail": "buyer@example.com",
+    "successUrl": "https://your-store.app/checkout/success",
+    "cancelUrl": "https://your-store.app/checkout/cancel",
+    "webhookUrl": "https://your-store.app/api/payments/siamvault-webhook"
   }'`;
 
   return (

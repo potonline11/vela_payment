@@ -552,7 +552,8 @@ export function dispatchSignedWebhook(
   db: GatewayDatabase,
   event: WebhookDelivery['event'],
   data: Record<string, unknown>,
-  transactionId?: string
+  transactionId?: string,
+  targetUrlOverride?: string
 ): WebhookDelivery {
   const payloadObj = {
     id: `evt_${crypto.randomBytes(6).toString('hex')}`,
@@ -563,12 +564,13 @@ export function dispatchSignedWebhook(
   };
   const payload = JSON.stringify(payloadObj);
   const sig = createWebhookSignatureHeader(payload, db.merchant.webhookSecret);
+  const targetUrl = targetUrlOverride?.trim() || db.merchant.webhookUrl;
 
   const delivery: WebhookDelivery = {
     id: `wh_dlv_${crypto.randomBytes(5).toString('hex')}`,
     event,
     transactionId,
-    targetUrl: db.merchant.webhookUrl,
+    targetUrl,
     timestamp: sig.timestamp,
     signatureHeader: sig.header,
     payload,
@@ -579,4 +581,27 @@ export function dispatchSignedWebhook(
 
   db.webhooks = [delivery, ...db.webhooks].slice(0, 50);
   return delivery;
+}
+
+export async function deliverWebhookHttp(delivery: WebhookDelivery): Promise<void> {
+  const url = delivery.targetUrl?.trim();
+  if (!url || !/^https?:\/\//i.test(url) || url.includes('.example/')) {
+    return;
+  }
+
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-SiamVault-Signature': delivery.signatureHeader,
+        'X-SiamVault-Event': delivery.event,
+      },
+      body: delivery.payload,
+      signal: AbortSignal.timeout(5000),
+    });
+    delivery.httpStatus = res.status;
+  } catch {
+    delivery.httpStatus = 0;
+  }
 }

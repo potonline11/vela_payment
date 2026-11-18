@@ -6,7 +6,9 @@ import type {
   PaymentIntent,
   PaymentMethod,
   SecurityPolicy,
+  StripeConfigResponse,
   TransactionRecord,
+  WebhookDelivery,
 } from '../src/types/gateway.ts';
 import {
   createCardFingerprint,
@@ -24,6 +26,7 @@ import {
 } from './security.ts';
 import {
   buildDashboardPayload,
+  deliverWebhookHttp,
   dispatchSignedWebhook,
   loadDb,
   saveDb,
@@ -60,10 +63,56 @@ function mapStripeCardBrand(brand?: string | null): CardBrand {
   }
 }
 
-function recordStripeSucceededIntent(db: GatewayDatabase, stripePi: Stripe.PaymentIntent): TransactionRecord {
+function getStripeConfigSummary(): StripeConfigResponse {
+  const secretKey = process.env.STRIPE_SECRET_KEY?.trim() ?? '';
+  const publishableKey = getStripePublishableKey();
+  const configured = Boolean(secretKey && publishableKey);
+  const isLive = secretKey.startsWith('sk_live_') || secretKey.startsWith('rk_live_');
+  const mode: StripeConfigResponse['mode'] = !configured ? 'unconfigured' : isLive ? 'live' : 'test';
+  return {
+    configured,
+    publishableKey,
+    mode,
+    webhookConfigured: Boolean(process.env.STRIPE_WEBHOOK_SECRET?.trim()),
+  };
+}
+
+function timingSafeHexMatch(aHex: string, bHex: string): boolean {
+  const aBuf = Buffer.from(aHex, 'hex');
+  const bBuf = Buffer.from(bHex, 'hex');
+  return aBuf.length === bBuf.length && crypto.timingSafeEqual(aBuf, bBuf);
+}
+
+function verifyMerchantSecret(req: express.Request, db: GatewayDatabase): boolean {
+  const authHeader = req.headers.authorization;
+  const xApiKey = req.headers['x-api-key'];
+  let token = '';
+  if (typeof authHeader === 'string' && authHeader.toLowerCase().startsWith('bearer ')) {
+    token = authHeader.slice(7).trim();
+  } else if (typeof xApiKey === 'string') {
+    token = xApiKey.trim();
+  }
+  if (!token) return false;
+
+  const tokenHash = sha256Hex(token);
+  if (timingSafeHexMatch(tokenHash, db.merchant.secretKeyHash)) {
+    return true;
+  }
+
+  const sharedEnvSecret = (process.env.PAYMENT_GATEWAY_SECRET || process.env.GATEWAY_API_SECRET)?.trim();
+  if (sharedEnvSecret && timingSafeHexMatch(tokenHash, sha256Hex(sharedEnvSecret))) {
+    return true;
+  }
+  return false;
+}
+
+function recordStripeSucceededIntent(
+  db: GatewayDatabase,
+  stripePi: Stripe.PaymentIntent
+): { tx: TransactionRecord; delivery?: WebhookDelivery } {
   const existing = db.transactions.find((t) => t.stripePaymentIntentId === stripePi.id);
   if (existing) {
-    return existing;
+    return { tx: existing };
   }
 
   const latestCharge =
@@ -141,11 +190,12 @@ function recordStripeSucceededIntent(db: GatewayDatabase, stripePi: Stripe.Payme
   }
 
   db.transactions = [tx, ...db.transactions];
-  dispatchSignedWebhook(
+  const delivery = dispatchSignedWebhook(
     db,
     'charge.succeeded',
     {
       transactionId: txId,
+      intentId: tx.intentId,
       stripePaymentIntentId: stripePi.id,
       orderId: tx.orderId,
       amount: tx.amount,
@@ -153,10 +203,11 @@ function recordStripeSucceededIntent(db: GatewayDatabase, stripePi: Stripe.Payme
       method,
       processor: 'stripe_thailand',
     },
-    txId
+    txId,
+    linkedIntent?.webhookUrl
   );
 
-  return tx;
+  return { tx, delivery };
 }
 
 function getClientKey(req: express.Request): string {
@@ -225,7 +276,10 @@ export function createApiApp(): express.Express {
           const expanded = await stripe.paymentIntents.retrieve(piObj.id, {
             expand: ['latest_charge'],
           });
-          recordStripeSucceededIntent(db, expanded);
+          const { delivery } = recordStripeSucceededIntent(db, expanded);
+          if (delivery) {
+            await deliverWebhookHttp(delivery);
+          }
           await saveDb(db);
         } else if (event.type === 'payment_intent.payment_failed') {
           const piObj = event.data.object as Stripe.PaymentIntent;
@@ -233,10 +287,19 @@ export function createApiApp(): express.Express {
           if (linkedIntent) {
             linkedIntent.status = 'declined';
           }
-          dispatchSignedWebhook(db, 'charge.declined', {
-            stripePaymentIntentId: piObj.id,
-            reason: piObj.last_payment_error?.message ?? 'Stripe payment failed',
-          });
+          const delivery = dispatchSignedWebhook(
+            db,
+            'charge.declined',
+            {
+              intentId: linkedIntent?.id,
+              orderId: linkedIntent?.orderId,
+              stripePaymentIntentId: piObj.id,
+              reason: piObj.last_payment_error?.message ?? 'Stripe payment failed',
+            },
+            undefined,
+            linkedIntent?.webhookUrl
+          );
+          await deliverWebhookHttp(delivery);
           await saveDb(db);
         } else if (event.type === 'charge.refunded') {
           const chargeObj = event.data.object as Stripe.Charge;
@@ -246,7 +309,15 @@ export function createApiApp(): express.Express {
             if (tx && tx.status !== 'refunded') {
               tx.status = 'refunded';
               tx.refundedAt = new Date().toISOString();
-              dispatchSignedWebhook(db, 'charge.refunded', { transactionId: tx.id, stripePaymentIntentId: piId }, tx.id);
+              const linkedIntent = db.intents.find((i) => i.id === tx.intentId);
+              const delivery = dispatchSignedWebhook(
+                db,
+                'charge.refunded',
+                { transactionId: tx.id, orderId: tx.orderId, stripePaymentIntentId: piId },
+                tx.id,
+                linkedIntent?.webhookUrl
+              );
+              await deliverWebhookHttp(delivery);
               await saveDb(db);
             }
           }
@@ -290,17 +361,7 @@ export function createApiApp(): express.Express {
 
   // Stripe Thailand Configuration & Status (never exposes secret key)
   app.get('/api/v1/stripe/config', (_req, res) => {
-    const secretKey = process.env.STRIPE_SECRET_KEY?.trim() ?? '';
-    const publishableKey = getStripePublishableKey();
-    const configured = Boolean(secretKey && publishableKey);
-    const mode = !configured ? 'unconfigured' : secretKey.startsWith('sk_live_') ? 'live' : 'test';
-
-    res.json({
-      configured,
-      publishableKey,
-      mode,
-      webhookConfigured: Boolean(process.env.STRIPE_WEBHOOK_SECRET?.trim()),
-    });
+    res.json(getStripeConfigSummary());
   });
 
   // Create real Stripe PaymentIntent (supports THB Credit/Debit Cards + PromptPay QR)
@@ -399,7 +460,10 @@ export function createApiApp(): express.Express {
       const db = await loadDb();
 
       if (stripePi.status === 'succeeded') {
-        const tx = recordStripeSucceededIntent(db, stripePi);
+        const { tx, delivery } = recordStripeSucceededIntent(db, stripePi);
+        if (delivery) {
+          await deliverWebhookHttp(delivery);
+        }
         await saveDb(db);
         res.json({
           status: 'succeeded',
@@ -573,6 +637,170 @@ export function createApiApp(): express.Express {
         ? db.transactions.find((t) => t.id === intent.transactionId) ?? null
         : null;
       res.json({ intent, transaction });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // Public safe Hosted Checkout read endpoint (never returns admin secrets or other transactions)
+  app.get('/api/v1/checkout-sessions/:id', async (req, res, next) => {
+    try {
+      const db = await loadDb();
+      const intent = db.intents.find((i) => i.id === req.params.id);
+      if (!intent) {
+        res.status(404).json({ error: 'ไม่พบรายการชำระเงิน หรือลิงก์หมดอายุแล้ว' });
+        return;
+      }
+      const transaction = intent.transactionId
+        ? db.transactions.find((t) => t.id === intent.transactionId) ?? null
+        : null;
+      res.json({
+        intent,
+        merchantName: db.merchant.merchantName,
+        promptPayId: db.merchant.promptPayId,
+        stripeConfig: getStripeConfigSummary(),
+        transaction,
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // Authenticated Merchant API for external storefronts (e.g., Vela Commerce)
+  app.post('/api/v1/merchant/checkout-sessions', async (req, res, next) => {
+    try {
+      const db = await loadDb();
+      if (!verifyMerchantSecret(req, db)) {
+        res.status(401).json({
+          error: 'Unauthorized: กรุณาระบุ Authorization: Bearer <Secret Key> ให้ถูกต้อง',
+        });
+        return;
+      }
+
+      const {
+        amount,
+        orderId,
+        description,
+        customerEmail,
+        successUrl,
+        cancelUrl,
+        webhookUrl,
+        idempotencyKey,
+      } = req.body as {
+        amount?: number;
+        orderId?: string;
+        description?: string;
+        customerEmail?: string;
+        successUrl?: string;
+        cancelUrl?: string;
+        webhookUrl?: string;
+        idempotencyKey?: string;
+      };
+
+      const numericAmount = round2(Number(amount));
+      if (!Number.isFinite(numericAmount) || numericAmount < 10) {
+        res.status(400).json({ error: 'ยอดชำระต้องไม่ต่ำกว่า 10.00 บาท (ขั้นต่ำของ Stripe Thailand)' });
+        return;
+      }
+      if (numericAmount > db.policy.maxAmountThb) {
+        res.status(400).json({
+          error: `ยอดเงินเกินวงเงินสูงสุดต่อรายการที่กำหนดไว้ (฿${db.policy.maxAmountThb.toLocaleString('en-US')})`,
+        });
+        return;
+      }
+
+      const proto = (req.headers['x-forwarded-proto']?.toString().split(',')[0] || req.protocol || 'https').trim();
+      const host = (req.headers['x-forwarded-host']?.toString().split(',')[0] || req.get('host') || 'velapayment.vercel.app').trim();
+      const buildCheckoutUrl = (id: string) => `${proto}://${host}/?checkout=${encodeURIComponent(id)}`;
+
+      const idemKey = idempotencyKey?.trim() || `idem_${crypto.randomBytes(6).toString('hex')}`;
+      const existingIntent = db.intents.find((i) => i.idempotencyKey === idemKey);
+      if (existingIntent) {
+        res.json({
+          intentId: existingIntent.id,
+          orderId: existingIntent.orderId,
+          amount: existingIntent.amount,
+          currency: 'THB',
+          status: existingIntent.status,
+          checkoutUrl: buildCheckoutUrl(existingIntent.id),
+          expiresAt: existingIntent.expiresAt,
+          idempotentReplay: true,
+        });
+        return;
+      }
+
+      const cleanOrderId = (orderId?.trim() || `ORD-${new Date().getFullYear()}-${Math.floor(1000 + Math.random() * 9000)}`).slice(0, 48);
+      const qrRef = `SV${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
+      const qrPayload = generatePromptPayEmvcoQr(db.merchant.promptPayId, numericAmount, qrRef);
+
+      const safeSuccessUrl = successUrl && /^https?:\/\//i.test(successUrl.trim()) ? successUrl.trim().slice(0, 300) : undefined;
+      const safeCancelUrl = cancelUrl && /^https?:\/\//i.test(cancelUrl.trim()) ? cancelUrl.trim().slice(0, 300) : undefined;
+      const safeWebhookUrl = webhookUrl && /^https?:\/\//i.test(webhookUrl.trim()) ? webhookUrl.trim().slice(0, 300) : undefined;
+
+      const intent: PaymentIntent = {
+        id: `pi_sv_${crypto.randomBytes(6).toString('hex')}`,
+        orderId: cleanOrderId,
+        amount: numericAmount,
+        currency: 'THB',
+        description: (description?.trim() || `ชำระเงินคำสั่งซื้อ ${cleanOrderId}`).slice(0, 140),
+        customerEmail: (customerEmail?.trim() || 'customer@vela-commerce.th').slice(0, 100),
+        idempotencyKey: idemKey,
+        status: 'open',
+        qrPayload,
+        qrReference: qrRef,
+        expiresAt: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
+        createdAt: new Date().toISOString(),
+        successUrl: safeSuccessUrl,
+        cancelUrl: safeCancelUrl,
+        webhookUrl: safeWebhookUrl,
+      };
+
+      db.intents = [intent, ...db.intents].slice(0, 100);
+      await saveDb(db);
+
+      res.status(201).json({
+        intentId: intent.id,
+        orderId: intent.orderId,
+        amount: intent.amount,
+        currency: 'THB',
+        status: intent.status,
+        checkoutUrl: buildCheckoutUrl(intent.id),
+        expiresAt: intent.expiresAt,
+        idempotentReplay: false,
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.get('/api/v1/merchant/checkout-sessions/:id', async (req, res, next) => {
+    try {
+      const db = await loadDb();
+      if (!verifyMerchantSecret(req, db)) {
+        res.status(401).json({
+          error: 'Unauthorized: กรุณาระบุ Authorization: Bearer <Secret Key> ให้ถูกต้อง',
+        });
+        return;
+      }
+
+      const intent = db.intents.find((i) => i.id === req.params.id);
+      if (!intent) {
+        res.status(404).json({ error: 'ไม่พบ Checkout Session ที่ระบุ' });
+        return;
+      }
+      const transaction = intent.transactionId
+        ? db.transactions.find((t) => t.id === intent.transactionId) ?? null
+        : null;
+
+      res.json({
+        intentId: intent.id,
+        orderId: intent.orderId,
+        amount: intent.amount,
+        currency: intent.currency,
+        status: intent.status,
+        paid: intent.status === 'succeeded',
+        transaction,
+      });
     } catch (err) {
       next(err);
     }
@@ -963,19 +1191,22 @@ export function createApiApp(): express.Express {
       const intent = db.intents.find((i) => i.id === tx.intentId);
       if (intent) intent.status = 'succeeded';
 
-      dispatchSignedWebhook(
+      const delivery = dispatchSignedWebhook(
         db,
         'charge.succeeded',
         {
           transactionId: tx.id,
+          intentId: tx.intentId,
           orderId: tx.orderId,
           amount: tx.amount,
           currency: 'THB',
           method: 'credit_card',
           threeDsStatus: 'authenticated',
         },
-        tx.id
+        tx.id,
+        intent?.webhookUrl
       );
+      await deliverWebhookHttp(delivery);
       await saveDb(db);
 
       res.json({ transaction: tx, dashboard: buildDashboardPayload(db) });
@@ -1060,19 +1291,22 @@ export function createApiApp(): express.Express {
       intent.status = 'succeeded';
       intent.transactionId = txId;
       db.transactions = [qrTx, ...db.transactions];
-      dispatchSignedWebhook(
+      const delivery = dispatchSignedWebhook(
         db,
         'charge.succeeded',
         {
           transactionId: txId,
+          intentId: intent.id,
           orderId: intent.orderId,
           amount: intent.amount,
           currency: 'THB',
           method: 'promptpay_qr',
           qrReference: intent.qrReference,
         },
-        txId
+        txId,
+        intent.webhookUrl
       );
+      await deliverWebhookHttp(delivery);
       await saveDb(db);
 
       res.json({
@@ -1112,18 +1346,22 @@ export function createApiApp(): express.Express {
 
       tx.status = 'refunded';
       tx.refundedAt = new Date().toISOString();
-      dispatchSignedWebhook(
+      const linkedIntent = db.intents.find((i) => i.id === tx.intentId);
+      const delivery = dispatchSignedWebhook(
         db,
         'charge.refunded',
         {
           transactionId: tx.id,
+          intentId: tx.intentId,
           stripePaymentIntentId: tx.stripePaymentIntentId,
           orderId: tx.orderId,
           refundedAmount: tx.amount,
           currency: 'THB',
         },
-        tx.id
+        tx.id,
+        linkedIntent?.webhookUrl
       );
+      await deliverWebhookHttp(delivery);
       await saveDb(db);
 
       res.json({ transaction: tx, dashboard: buildDashboardPayload(db) });
@@ -1141,6 +1379,7 @@ export function createApiApp(): express.Express {
         message: 'SiamVault Pay Webhook Endpoint Verification',
         merchantId: db.merchant.merchantId,
       });
+      await deliverWebhookHttp(delivery);
       await saveDb(db);
       res.json({ delivery, dashboard: buildDashboardPayload(db) });
     } catch (err) {

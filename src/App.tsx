@@ -14,6 +14,7 @@ import { OverviewLedger } from './components/OverviewLedger';
 import { LiveCheckout } from './components/LiveCheckout';
 import { SecurityVault } from './components/SecurityVault';
 import { WebhooksDev } from './components/WebhooksDev';
+import { HostedCheckoutPage } from './components/HostedCheckoutPage';
 
 type TabId = 'overview' | 'checkout' | 'security' | 'webhooks';
 
@@ -25,6 +26,11 @@ const NAV_ITEMS: Array<{ id: TabId; label: string; Icon: typeof Activity }> = [
 ];
 
 export default function App() {
+  const [checkoutIntentId] = useState<string | null>(() => {
+    if (typeof window === 'undefined') return null;
+    return new URLSearchParams(window.location.search).get('checkout');
+  });
+
   const [activeTab, setActiveTab] = useState<TabId>('overview');
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [dashboard, setDashboard] = useState<DashboardPayload | null>(null);
@@ -33,6 +39,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
 
   const fetchDashboard = useCallback(async (isManualRefresh = false) => {
+    if (checkoutIntentId) return;
     if (isManualRefresh) setRefreshing(true);
     setError(null);
     try {
@@ -60,6 +67,10 @@ export default function App() {
     if (res.ok && json.dashboard) {
       setDashboard(json.dashboard);
     }
+  }
+
+  if (checkoutIntentId) {
+    return <HostedCheckoutPage intentId={checkoutIntentId} />;
   }
 
   const currentNavLabel = NAV_ITEMS.find((item) => item.id === activeTab)?.label ?? 'ภาพรวมและธุรกรรม';
